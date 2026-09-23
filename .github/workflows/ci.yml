@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libchromaprint-tools
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ffmpeg chromaprint
+
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ffmpeg chromaprint -y --no-progress
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy mutagen
+
+      - name: Show tool versions
+        run: |
+          ffmpeg -version | head -1
+          fpcalc -version
+          python --version
+
+      - name: Generate a test tone
+        shell: bash
+        run: |
+          mkdir -p testmusic
+          ffmpeg -y -v error -f lavfi -i "sine=frequency=440:duration=45" \
+            -codec:a libmp3lame -b:a 128k testmusic/TestTone.mp3
+          ls -la testmusic
+
+      - name: Run compress + identify end to end
+        shell: bash
+        run: |
+          python simplyconvert.py compressidentify testmusic -o out_ogg --bitrate 160
+          echo "=== output tree ==="
+          find out_ogg -type f | sort
+
+      - name: Verify the converted copy
+        shell: bash
+        run: |
+          test -f out_ogg/TestTone.ogg
+          ffprobe -v error -show_entries format=format_name,duration -of json out_ogg/TestTone.ogg
+          python - <<'EOF'
+          from mutagen.oggopus import OggOpus
+          a = OggOpus("out_ogg/TestTone.ogg")
+          tags = a.tags.as_dict()
+          print("tags:", {k: v for k, v in tags.items() if not k.startswith("metadata")})
+          assert "replaygain_track_gain" in tags, "ReplayGain tag missing"
+          print("OK: Ogg/Opus copy with ReplayGain tag produced")
+          EOF
+
+      - name: Verify idempotent relaunch
+        shell: bash
+        run: |
+          python simplyconvert.py compress testmusic -o out_ogg --bitrate 160 | tail -3
