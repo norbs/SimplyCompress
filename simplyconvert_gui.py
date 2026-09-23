@@ -36,14 +36,22 @@ class ApplyLog:
         self.widget.tag_configure("dim", foreground=DIM)
 
     def pump(self):
+        # The Text is kept disabled (read-only look) — but Tk silently drops
+        # insertions into a disabled widget, so enable around each batch.
+        inserted = False
+        self.widget.configure(state="normal")
         try:
             while True:
                 line = self.q.get_nowait()
                 tag = "dim" if line.startswith("  ") else None
                 self.widget.insert(tk.END, line + "\n", tag)
                 self.widget.see(tk.END)
+                inserted = True
         except queue.Empty:
             pass
+        if inserted:
+            self.widget.see(tk.END)
+        self.widget.configure(state="disabled")
         self.widget.after(120, self.pump)
 
 
@@ -103,7 +111,7 @@ class App(tk.Tk):
         row(opts, 3, "Débit Ogg/Opus")
         self.br_var = tk.IntVar(value=160)
         br_box = ttk.Combobox(opts, textvariable=self.br_var, state="readonly",
-                              values=[160, 180, 320], width=22)
+                              values=[128, 160, 180, 320], width=22)
         br_box.grid(row=3, column=1, sticky="w", padx=6)
 
         self.auto_var = tk.BooleanVar(value=True)
@@ -114,12 +122,20 @@ class App(tk.Tk):
                        selectcolor=BG, relief="flat", highlightthickness=0) \
             .grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        self.fast_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(opts, text="Vitesse maximale (sans priorité basse — la "
+                       "machine peut ralentir pendant la conversion)",
+                       variable=self.fast_var, bg=PANEL, fg=TEXT,
+                       activebackground=PANEL, activeforeground=TEXT,
+                       selectcolor=BG, relief="flat", highlightthickness=0) \
+            .grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         self.dry_var = tk.BooleanVar(value=False)
         tk.Checkbutton(opts, text="Simulation (--dry-run : rien n'est écrit)",
                        variable=self.dry_var, bg=PANEL, fg=TEXT,
                        activebackground=PANEL, activeforeground=TEXT,
                        selectcolor=BG, relief="flat", highlightthickness=0) \
-            .grid(row=5, column=0, columnspan=3, sticky="w")
+            .grid(row=7, column=0, columnspan=3, sticky="w")
 
         opts.columnconfigure(1, weight=1)
 
@@ -202,6 +218,8 @@ class App(tk.Tk):
                "--bitrate", str(self.br_var.get())]
         if not self.auto_var.get():
             cmd.append("--no-auto-volume")
+        if self.fast_var.get():
+            cmd.append("--fast")
         if self.dry_var.get():
             cmd.append("--dry-run")
 

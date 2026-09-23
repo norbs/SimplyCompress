@@ -359,15 +359,18 @@ def cmd_compress(args) -> dict:
     except (OSError, json.JSONDecodeError):
         manifest = {}
 
+    t_start = time.monotonic()
     files = list(walk_library(src_root, out_root))
     log(f"{len(files)} fichier(s) audio à traiter (auto-volume={'on' if args.auto_volume else 'off'}, "
-        f"{args.bitrate} kbps)")
+        f"{args.bitrate} kbps, "
+        f"{'vitesse maximale' if getattr(args, 'fast', False) else 'priorité basse'})")
 
     stats = {"converted": 0, "kept": 0, "prefilter": 0, "bigger": 0, "failed": 0}
-    try:
-        os.nice(10)  # low priority, like the app's MIN_PRIORITY engine
-    except (AttributeError, OSError):
-        pass
+    if not getattr(args, "fast", False):
+        try:
+            os.nice(10)  # low priority, like the app's MIN_PRIORITY engine
+        except (AttributeError, OSError):
+            pass
 
     for i, (src, rel_dir, stem, ext) in enumerate(files, 1):
         rel_src = os.path.relpath(src, src_root)
@@ -381,6 +384,9 @@ def cmd_compress(args) -> dict:
             stats["kept"] += 1
             continue
 
+        # Per-track wall time: everything for this file counts (probe,
+        # ReplayGain analysis, encode, tag copy).
+        t0 = time.monotonic()
         probe = ffprobe_json(src)
         if not probe:
             log(f"  [{i}/{len(files)}] illisible, ignoré : {rel_src}")
@@ -438,7 +444,8 @@ def cmd_compress(args) -> dict:
         stats["converted"] += 1
         log(f"      → {os.path.relpath(final, out_root)} "
             f"({os.path.getsize(src) // 1024} → {new_size // 1024} ko, "
-            f"{'-' if saved >= 0 else '+'}{abs(saved) // 1024} ko)")
+            f"{'-' if saved >= 0 else '+'}{abs(saved) // 1024} ko, "
+            f"{time.monotonic() - t0:.1f} s)")
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1, ensure_ascii=False)
@@ -447,9 +454,11 @@ def cmd_compress(args) -> dict:
                     if os.path.exists(os.path.join(src_root, r)))
     total_out = sum(os.path.getsize(os.path.join(out_root, p)) for p in manifest.values()
                     if os.path.exists(os.path.join(out_root, p)))
+    elapsed = time.monotonic() - t_start
     log(f"\nRésumé : {stats['converted']} convertis, {stats['kept']} déjà à jour, "
         f"{stats['prefilter']} sautés (déjà compressés), {stats['bigger']} plus gros, "
-        f"{stats['failed']} échecs")
+        f"{stats['failed']} échecs — {elapsed:.1f} s"
+        + (f" ({elapsed / stats['converted']:.1f} s/morceau)" if stats["converted"] else ""))
     log(f"Espace : {total_src // (1024 * 1024)} Mo → {total_out // (1024 * 1024)} Mo "
         f"(gagné : {(total_src - total_out) // (1024 * 1024)} Mo)")
     return {"out_root": out_root, "manifest": manifest}
@@ -628,6 +637,7 @@ def cmd_identify(args, compress_result=None):
     files = [os.path.join(out_root, rel) for rel in manifest.values()]
     files = [f for f in files if os.path.exists(f)]
     fpcalc = find_fpcalc()
+    t_start = time.monotonic()
     log(f"\nIdentification de {len(files)} copie(s) compressée(s)…")
 
     ok = no_match = failed = 0
@@ -637,6 +647,7 @@ def cmd_identify(args, compress_result=None):
         dur = duration_seconds(probe)
         existing_title = (probe.get("format", {}).get("tags", {}) or {}).get("title", "")
         log(f"  [{i}/{len(files)}] {name}")
+        t0 = time.monotonic()
         try:
             fp = fingerprint(path, dur, fpcalc)
         except RuntimeError as e:
@@ -670,9 +681,10 @@ def cmd_identify(args, compress_result=None):
         if cover:
             set_cover(path, cover)
         log(f"      « {title} » — {artist}" + (f" — {album} ({date})" if album else "")
-            + f"  (score {score:.2f}, Δ{delta}s)")
+            + f"  (score {score:.2f}, Δ{delta}s, {time.monotonic() - t0:.1f} s)")
         ok += 1
-    log(f"\nIdentification : {ok} tagués, {no_match} sans correspondance, {failed} échecs")
+    log(f"\nIdentification : {ok} tagués, {no_match} sans correspondance, {failed} échecs"
+        + (f" — {time.monotonic() - t_start:.1f} s" if ok + no_match + failed else ""))
 
 
 # ----------------------------------------------------------------------------
@@ -690,9 +702,11 @@ def main():
     p = sub.add_parser("compress", help="compresser la bibliothèque en Ogg/Opus")
     add_common(p)
     p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE_KBPS,
-                   choices=[160, 180, 320])
+                   choices=[128, 160, 180, 320])
     p.add_argument("--auto-volume", dest="auto_volume", action="store_true", default=True)
     p.add_argument("--no-auto-volume", dest="auto_volume", action="store_false")
+    p.add_argument("--fast", action="store_true",
+                   help="exécuter à pleine vitesse (pas de priorité basse)")
     p.add_argument("--dry-run", action="store_true")
 
     p = sub.add_parser("identify", help="identifier et taguer les copies compressées")
@@ -702,9 +716,11 @@ def main():
     p = sub.add_parser("compressidentify", help="compress puis identify (taggage + compression)")
     add_common(p)
     p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE_KBPS,
-                   choices=[160, 180, 320])
+                   choices=[128, 160, 180, 320])
     p.add_argument("--auto-volume", dest="auto_volume", action="store_true", default=True)
     p.add_argument("--no-auto-volume", dest="auto_volume", action="store_false")
+    p.add_argument("--fast", action="store_true",
+                   help="exécuter à pleine vitesse (pas de priorité basse)")
     p.add_argument("--dry-run", action="store_true")
 
     args = ap.parse_args()
