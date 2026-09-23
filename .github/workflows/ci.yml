@@ -52,9 +52,12 @@ jobs:
       - name: Generate a test tone
         shell: bash
         run: |
+          # Lossless source: it is always converted (lossy sources may be
+          # skipped when the Ogg copy would be larger than the original —
+          # which is exactly what happened with a 128k MP3 test tone).
           mkdir -p testmusic
           ffmpeg -y -v error -f lavfi -i "sine=frequency=440:duration=45" \
-            -codec:a libmp3lame -b:a 128k testmusic/TestTone.mp3
+            -codec:a flac testmusic/TestTone.flac
           ls -la testmusic
 
       - name: Run compress + identify end to end
@@ -77,7 +80,6 @@ jobs:
           assert "replaygain_track_gain" in tags, "ReplayGain tag missing"
           print("OK: Ogg/Opus copy with ReplayGain tag produced")
           EOF
-
       - name: Verify idempotent relaunch
         shell: bash
         run: |

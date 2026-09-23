@@ -78,7 +78,14 @@ _TMP_DIR = tempfile.gettempdir()
 
 
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    # Windows consoles default to cp1252, which cannot encode glyphs like '→'
+    # (UnicodeEncodeError would abort the whole run). Replace un-encodable
+    # characters instead of crashing.
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        print(msg.encode(sys.stdout.encoding or "ascii", "replace").decode(
+            sys.stdout.encoding or "ascii"), flush=True)
 
 
 # ----------------------------------------------------------------------------

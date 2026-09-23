@@ -1,5 +1,7 @@
 # SimplyConvert — PC companion of SimplyPlay
 
+[![CI](https://github.com/norbs/SimplyCompress/actions/workflows/ci.yml/badge.svg)](https://github.com/norbs/SimplyCompress/actions/workflows/ci.yml)
+
 Applies the same compression (Ogg/Opus with ReplayGain) and online
 identification (AcoustID/MusicBrainz) engines as the Android app to a PC
 music folder. **Originals are never touched**; results land in a separate
