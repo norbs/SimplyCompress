@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.simplyplay_manifest.json
+.simplyconvert_rg_cache.json
