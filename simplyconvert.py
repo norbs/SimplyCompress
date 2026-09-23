@@ -103,11 +103,18 @@ def walk_library(src_root: str, out_root: str):
                 yield os.path.join(dirpath, fn), rel_dir, stem, ext[1:].lower()
 
 
+def _subprocess_flags() -> int:
+    """Windows: never let helper processes open console windows (the GUI runs
+    under pythonw.exe — a console flash per ffmpeg call would be ugly)."""
+    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
 def ffprobe_json(path: str) -> dict:
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-print_format", "json",
          "-show_format", "-show_streams", path],
-        capture_output=True, text=True)
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=_subprocess_flags())
     if r.returncode != 0:
         return {}
     try:
@@ -194,7 +201,8 @@ def measure_replaygain(src: str) -> tuple:
     """
     cmd = ["ffmpeg", "-v", "error", "-i", src, "-map", "0:a:0",
            "-c:a", "pcm_s16le", "-f", "s16le", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=_subprocess_flags())
     sq_sum = 0.0
     sample_count = 0
     peak = 0
@@ -244,7 +252,9 @@ def convert_to_ogg(src: str, dst_tmp: str, kbps: int):
     """Decode -> libopus Ogg. Tags/cover are copied afterwards by mutagen."""
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", src, "-map", "0:a:0",
            "-vn", "-c:a", "libopus", "-b:a", f"{kbps}k", "-f", "ogg", dst_tmp]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace",
+                       creationflags=_subprocess_flags())
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {r.stderr[-300:]}")
 
@@ -299,7 +309,7 @@ def copy_tags_with_cover(src: str, opus_path: str, rg: tuple):
             r = subprocess.run(
                 ["ffmpeg", "-y", "-v", "error", "-i", src,
                  "-map", f"0:{st['index']}", "-frames:v", "1", pic_file],
-                capture_output=True)
+                capture_output=True, creationflags=_subprocess_flags())
             if r.returncode != 0:
                 pic_file = None
             break

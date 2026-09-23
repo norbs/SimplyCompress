@@ -209,9 +209,12 @@ class App(tk.Tk):
         self.log_widget.delete("1.0", tk.END)
         self.log_widget.configure(state="disabled")
         self.apply_btn.configure(state="disabled", text="EN COURS…")
+        # CREATE_NO_WINDOW: the engine must not flash a console on Windows.
+        no_window = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1)
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            creationflags=no_window)
         threading.Thread(target=self.drain, daemon=True).start()
 
     def drain(self):
