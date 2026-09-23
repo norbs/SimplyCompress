@@ -572,41 +572,146 @@ def pick_candidate(root: dict, duration: int):
             cands.append((score, delta, artist, title, rec))
     if not cands:
         return None
-    cands.sort(key=lambda c: (0 if c[1] <= DURATION_SLACK_SEC else 1, -c[0], c[1]))
+
+    def has_primary(rec: dict) -> bool:
+        # Any release-group AcoustID does not flag as compilation/live/etc.
+        # (missing type data counts as unknown, i.e. possibly primary).
+        return any(not (g.get("secondary-types") or g.get("secondarytypes"))
+                   for g in rec.get("releasegroups", []) or [])
+
+    cands.sort(key=lambda c: (0 if c[1] <= DURATION_SLACK_SEC else 1, -c[0],
+                              0 if has_primary(c[4]) else 1, c[1]))
     return cands[0]
 
 
-def fetch_album_info(rec: dict) -> tuple:
-    """(album, date, cover_bytes|None) via MusicBrainz + Cover Art Archive."""
-    rg = None
-    for group in rec.get("releasegroups", []) or []:
-        if not group.get("secondary-types"):
-            rg = group
-            break
-    rg = rg or (next(iter(rec.get("releasegroups", []) or []), None))
-    if not rg:
-        return None, None, None
-    album, date = rg.get("title"), None
-    releases = rg.get("releases") or []
-    release_id = releases[0].get("id") if releases else None
-    if release_id:
+def fetch_album_info(rec: dict, acoustid_root: dict | None = None) -> tuple:
+    """(album, date, cover_bytes|None) via MusicBrainz + Cover Art Archive.
+
+    The release-groups AcoustID nests in a recording are unreliable for old
+    hits: mostly compilations, dates almost never filled, order arbitrary —
+    taking the first "non-secondary" one once tagged Joe Dassin's L'Été
+    indien with a random compilation (« A French Affair ») instead of the
+    1974 single. So instead:
+      1. collect the groups of every recording of the best result (the
+         original single/album often hangs on a sibling recording, and
+         MusicBrainz's own browse sometimes only exposes compilations),
+      2. merge the groups MusicBrainz itself links to the recording
+         (authoritative types/dates) with the AcoustID ones,
+      3. verify the primary-looking ones on MusicBrainz one by one
+         (release-group lookup: real types + first-release-date) and keep
+         the first that is neither compilation nor live/etc. — the original
+         release — falling back to the earliest dated group of any kind when
+         the track only ever appeared on compilations (same rule as
+         TagFetcher.kt).
+    """
+    rec_id = rec.get("id") or ""
+    acoustid_groups, seen_ids = [], set()
+    recs = [rec]
+    if acoustid_root:
+        recs += [r for res in acoustid_root.get("results", []) or []
+                 for r in res.get("recordings", []) or []]
+    for r in recs:
+        for g in r.get("releasegroups", []) or []:
+            if g.get("id") and g["id"] not in seen_ids:
+                seen_ids.add(g["id"])
+                acoustid_groups.append(g)
+
+    browse_groups = []
+    if rec_id:
         try:
-            rel = http_get_json(
-                f"https://musicbrainz.org/ws/2/release/{release_id}"
-                f"?inc=release-groups&fmt=json")
-            date = rel.get("date")
+            data = http_get_json(
+                f"https://musicbrainz.org/ws/2/release?recording={rec_id}"
+                f"&inc=release-groups&fmt=json&limit=100")
+            seen = set()
+            for rel in data.get("releases", []) or []:
+                g = dict(rel.get("release-group") or {})
+                gid = g.get("id")
+                if not gid or gid in seen:
+                    continue
+                seen.add(gid)
+                g["secondary-types"] = g.get("secondary-types") or []
+                browse_groups.append(g)
         except (OSError, json.JSONDecodeError):
-            pass
+            pass  # MusicBrainz unreachable: fall back to the AcoustID groups
+
+    def sec_of(g: dict) -> list:
+        return g.get("secondary-types") or g.get("secondarytypes") or []
+
+    def primary_type_ok(info: dict) -> bool:
+        # MusicBrainz exposes primary-type (str) and secondary-types (list).
+        pt = info.get("primary-types") or ([info["primary-type"]]
+                                           if info.get("primary-type") else [])
+        return not pt or any(t in ("Album", "Single", "EP") for t in pt)
+
+    # Groups worth verifying: those AcoustID does not already flag as
+    # compilation/live/etc. AcoustID's type is often absent, so rank known
+    # albums first, unknown next, singles last; dated groups (rare) first
+    # within a class, then MusicBrainz browse entries before AcoustID ones.
+    def rank(g: dict):
+        order = {"Album": 0, "Single": 2}.get(g.get("type") or "", 1)
+        return (order,
+                0 if g.get("first-release-date") else 1,
+                g.get("first-release-date") or "",
+                0 if g in browse_groups else 1)
+
+    cand_ids, candidates = set(), []
+    for g in browse_groups + acoustid_groups:
+        gid = g.get("id")
+        if not gid or gid in cand_ids or sec_of(g):
+            continue
+        cand_ids.add(gid)
+        candidates.append(g)
+    candidates.sort(key=rank)
+
+    winner = None
+    verified = []  # MB info of everything checked — compilation-only fallback
+    for g in candidates[:8]:
+        try:
+            info = http_get_json(
+                f"https://musicbrainz.org/ws/2/release-group/{g['id']}?fmt=json")
+        except (OSError, json.JSONDecodeError):
+            continue
+        verified.append(info)
+        if not (info.get("secondary-types") or []) and primary_type_ok(info):
+            winner = info
+            break
+
+    if winner is not None:
+        gid = winner.get("id")
+        date = winner.get("first-release-date") or None
+        winner_primary = (winner.get("primary-types")
+                          or ([winner["primary-type"]] if winner.get("primary-type") else []))
+        if winner_primary == ["Single"]:
+            # A-side/B-side single titles are noisy (« X (Y) / Z »): a
+            # standalone single reads better under the track's own name.
+            album = (rec.get("title") or winner.get("title") or "").strip()
+        else:
+            album = (winner.get("title") or "").strip()
+    else:
+        # Nothing verifiable turned out non-compilation: earliest dated group
+        # of any kind (canonical album, like the app); list order when no date.
+        pool = [info for info in verified if info.get("id")]
+        pool += browse_groups + acoustid_groups
+        best = min(pool, key=lambda g: g.get("first-release-date") or "9999") \
+            if pool else None
+        if not best:
+            return None, None, None
+        gid = best.get("id")
+        album = best.get("title")
+        date = best.get("first-release-date") or None
+
+    cover = None
+    if gid:
         try:
             req = urllib.request.Request(
-                f"https://coverartarchive.org/release/{release_id}/front-500",
+                f"https://coverartarchive.org/release-group/{gid}/front-500",
                 headers={"User-Agent": MB_UA})
             with urllib.request.urlopen(req, timeout=20) as resp:
                 if resp.status == 200 and resp.headers.get_content_type().startswith("image/"):
-                    return album, date, resp.read()
+                    cover = resp.read()
         except OSError:
             pass
-    return album, date, None
+    return album, date, cover
 
 
 def set_cover(opus_path: str, data: bytes):
@@ -631,11 +736,25 @@ def cmd_identify(args, compress_result=None):
             with open(os.path.join(out_root, MANIFEST_NAME), encoding="utf-8") as f:
                 manifest = json.load(f)
         except (OSError, json.JSONDecodeError):
-            log("Aucun manifest : lancez d'abord compress (les originaux ne "
-                "sont jamais retagués).")
-            return
+            manifest = {}
     files = [os.path.join(out_root, rel) for rel in manifest.values()]
     files = [f for f in files if os.path.exists(f)]
+    if not files:
+        # No manifest, a manifest that points nowhere (output tree moved or
+        # wiped), or compress skipped everything as "bigger" so nothing was
+        # written yet. The output tree is the only thing we may ever tag,
+        # so identify whatever Ogg copies exist there (originaux jamais touchés).
+        files = [os.path.join(dirpath, fn)
+                 for dirpath, _, fns in os.walk(out_root)
+                 for fn in fns if fn.lower().endswith((".opus", ".ogg"))]
+        files.sort()
+        if not files:
+            log("Aucune copie à identifier dans le dossier de sortie : rien n'a "
+                "été converti (déjà compressé, plus gros que l'original, ou "
+                "compress jamais lancé). Les originaux ne sont jamais retagués.")
+            return
+        log("(manifeste absent ou vide — identification de toutes les copies "
+            "Ogg/Opus trouvées dans le dossier de sortie)")
     fpcalc = find_fpcalc()
     t_start = time.monotonic()
     log(f"\nIdentification de {len(files)} copie(s) compressée(s)…")
@@ -664,7 +783,7 @@ def cmd_identify(args, compress_result=None):
             no_match += 1
             continue
         score, delta, artist, title, rec = best
-        album, date, cover = fetch_album_info(rec)
+        album, date, cover = fetch_album_info(rec, root)
         if args.dry_run:
             log(f"      (dry-run) « {title} » — {artist}"
                 + (f" — {album} ({date})" if album else ""))

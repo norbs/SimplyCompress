@@ -213,13 +213,16 @@ class App(tk.Tk):
             messagebox.showinfo("SimplyConvert", "Un traitement est déjà en cours.")
             return
 
-        cmd = [sys.executable, "-u", SCRIPT,
-               self.mode_var.get(), src, "-o", out,
-               "--bitrate", str(self.br_var.get())]
-        if not self.auto_var.get():
-            cmd.append("--no-auto-volume")
-        if self.fast_var.get():
-            cmd.append("--fast")
+        mode = self.mode_var.get()
+        cmd = [sys.executable, "-u", SCRIPT, mode, src, "-o", out]
+        # Bitrate / auto-volume / speed only exist for the compress modes;
+        # the identify parser would reject them ("argument inconnu").
+        if mode != "identify":
+            cmd += ["--bitrate", str(self.br_var.get())]
+            if not self.auto_var.get():
+                cmd.append("--no-auto-volume")
+            if self.fast_var.get():
+                cmd.append("--fast")
         if self.dry_var.get():
             cmd.append("--dry-run")
 
