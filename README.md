@@ -33,6 +33,8 @@ dry-run — and an **APPLIQUER** button with a live log.
 python3 simplyconvert.py compressidentify ~/Musique -o ~/Musique_Ogg
 ```
 
-- `compress` — convert to Ogg/Opus (lossless always; lossy only if smaller)
-- `identify` — fingerprint + tag artist/title/album/date/cover on the **copies**
+- `compress` — convert to Ogg/Opus (lossless always; lossy only if smaller —
+  when the result is bigger, the original is copied as-is to the output tree)
+- `identify` — fingerprint + tag artist/title/album/date/cover on the
+  **copies** (converted files and copied originals)
 - `compressidentify` — both in one pass

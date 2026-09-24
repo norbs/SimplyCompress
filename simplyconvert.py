@@ -8,16 +8,20 @@ Applies the SAME two engines as the app to a PC music folder:
                - lossless sources always convert
                - lossy sources only convert if the result is smaller
                  (pre-filter: a lossy source already at/below target+slack
-                 is skipped — unless auto-volume is on, mirroring the app)
+                 is skipped — unless auto-volume is on, mirroring the app);
+                 when the Opus result is BIGGER than the original, the
+                 original is copied as-is to the output tree instead
                - the ORIGINALS ARE NEVER TOUCHED and never re-tagged;
                  results land in a separate output tree that mirrors the
-                 source layout, named "Title.ogg" (collision -> Title-2.ogg)
+                 source layout, named "Title.ogg" (existing destination ->
+                 skipped)
                - ReplayGain analysis (same math as the app) is written as
                  REPLAYGAIN_TRACK_GAIN/PEAK comments on the copy
   identify   Fingerprint each track (chromaprint, like the app) and fill
              artist/title/album/date/cover from AcoustID + MusicBrainz +
-             Cover Art Archive. Tags are written ONLY on the compressed
-             copies — originals are read-only for this tool, ever.
+             Cover Art Archive. Tags are written ONLY on the output-tree
+             copies (converted files and copied originals) — source files
+             are read-only for this tool, ever.
 
   compressidentify  compress + identify in one pass (tagging + compression).
 
@@ -37,7 +41,10 @@ import urllib.parse
 import urllib.request
 
 import numpy as np
-from mutagen.flac import Picture
+from mutagen import File as MutagenFile, MutagenError
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import APIC, ID3
+from mutagen.mp4 import MP4Cover
 from mutagen.oggopus import OggOpus
 
 # ----------------------------------------------------------------------------
@@ -156,14 +163,11 @@ def duration_seconds(probe: dict) -> int:
         return 0
 
 
-def resolve_out_name(out_dir: str, stem: str) -> str:
-    """Title.ogg, or Title-2.ogg / Title-3.ogg… when taken (app rule)."""
-    candidate = os.path.join(out_dir, f"{stem}.ogg")
-    n = 2
-    while os.path.exists(candidate):
-        candidate = os.path.join(out_dir, f"{stem}-{n}.ogg")
-        n += 1
-    return candidate
+def destination_exists(out_dir: str, stem: str) -> bool:
+    """True when "Title.ogg" (previous conversion or copy of the original)
+    already occupies the output name — the file must be skipped, never
+    suffixed into a Title-2.ogg duplicate."""
+    return os.path.exists(os.path.join(out_dir, f"{stem}.ogg"))
 
 
 # ----------------------------------------------------------------------------
@@ -365,7 +369,8 @@ def cmd_compress(args) -> dict:
         f"{args.bitrate} kbps, "
         f"{'vitesse maximale' if getattr(args, 'fast', False) else 'priorité basse'})")
 
-    stats = {"converted": 0, "kept": 0, "prefilter": 0, "bigger": 0, "failed": 0}
+    stats = {"converted": 0, "kept": 0, "prefilter": 0, "copied": 0, "failed": 0,
+             "dest_exists": 0}
     if not getattr(args, "fast", False):
         try:
             os.nice(10)  # low priority, like the app's MIN_PRIORITY engine
@@ -402,6 +407,15 @@ def cmd_compress(args) -> dict:
                 stats["prefilter"] += 1
                 continue
 
+        # Destination guard: "Title.ogg" (previous conversion) or a previous
+        # copy of the original under its own extension already there? Skip —
+        # never write a Title-2.ogg / Title-2.mp3 duplicate.
+        if destination_exists(out_dir, stem) or os.path.exists(
+                os.path.join(out_dir, f"{stem}.{ext}")):
+            log(f"  [{i}/{len(files)}] destination déjà présente, sauté : {rel_src}")
+            stats["dest_exists"] += 1
+            continue
+
         # ReplayGain analysis (cached) — feeds the tags written on the copy.
         rg = None
         if args.auto_volume:
@@ -418,7 +432,7 @@ def cmd_compress(args) -> dict:
                 rg = (cached["gain"], cached["peak"])
 
         log(f"  [{i}/{len(files)}] conversion : {rel_src}")
-        tmp = resolve_out_name(out_dir, stem) + ".part"
+        tmp = os.path.join(out_dir, f"{stem}.ogg") + ".part"
         try:
             convert_to_ogg(src, tmp, args.bitrate)
             copy_tags_with_cover(src, tmp, rg)
@@ -429,12 +443,18 @@ def cmd_compress(args) -> dict:
                 os.remove(tmp)
             continue
 
-        # Size gate: lossy copies must be smaller, like the app.
+        # Size gate: lossy copies must be smaller, like the app — and when
+        # the result would be bigger, the ORIGINAL is copied as-is to the
+        # output tree so it still lands there and can be identified/tagged.
         new_size = os.path.getsize(tmp)
         if not lossless and new_size >= os.path.getsize(src):
             os.remove(tmp)
-            log(f"      résultat plus gros que l'original — sauté")
-            stats["bigger"] += 1
+            copy_dst = os.path.join(out_dir, f"{stem}.{ext}")
+            shutil.copy2(src, copy_dst)
+            manifest[rel_src] = os.path.relpath(copy_dst, out_root)
+            stats["copied"] += 1
+            log(f"      résultat plus gros que l'original — original copié "
+                f"({os.path.getsize(src) // 1024} ko)")
             continue
 
         final = tmp[:-len(".part")]
@@ -455,9 +475,10 @@ def cmd_compress(args) -> dict:
     total_out = sum(os.path.getsize(os.path.join(out_root, p)) for p in manifest.values()
                     if os.path.exists(os.path.join(out_root, p)))
     elapsed = time.monotonic() - t_start
-    log(f"\nRésumé : {stats['converted']} convertis, {stats['kept']} déjà à jour, "
-        f"{stats['prefilter']} sautés (déjà compressés), {stats['bigger']} plus gros, "
-        f"{stats['failed']} échecs — {elapsed:.1f} s"
+    log(f"\nRésumé : {stats['converted']} convertis, {stats['copied']} originaux copiés "
+        f"(résultat plus gros), {stats['kept']} déjà à jour, "
+        f"{stats['prefilter']} sautés (déjà compressés), {stats['dest_exists']} sautés "
+        f"(destination présente), {stats['failed']} échecs — {elapsed:.1f} s"
         + (f" ({elapsed / stats['converted']:.1f} s/morceau)" if stats["converted"] else ""))
     log(f"Espace : {total_src // (1024 * 1024)} Mo → {total_out // (1024 * 1024)} Mo "
         f"(gagné : {(total_src - total_out) // (1024 * 1024)} Mo)")
@@ -714,15 +735,34 @@ def fetch_album_info(rec: dict, acoustid_root: dict | None = None) -> tuple:
     return album, date, cover
 
 
-def set_cover(opus_path: str, data: bytes):
-    audio = OggOpus(opus_path)
+def set_cover(path: str, data: bytes):
+    """Embed cover art in a copy, whatever container it uses: MP3 -> APIC
+    frame, M4A/MP4 -> covr box, FLAC -> PICTURE block, Ogg/Opus (default) ->
+    base64 METADATA_BLOCK_PICTURE comment."""
     pic = Picture()
     pic.type = 3
     pic.mime = "image/jpeg"
     pic.desc = "Cover"
     pic.data = data
-    audio["METADATA_BLOCK_PICTURE"] = base64.b64encode(pic.write()).decode("ascii")
-    audio.save()
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    if ext == "mp3":
+        tags = ID3(path)
+        tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover",
+                      data=data))
+        tags.save()
+    elif ext in {"m4a", "m4b", "m4p", "m4r", "mp4"}:
+        audio = MutagenFile(path, easy=True)
+        audio["covr"] = [MP4Cover(data, MP4Cover.FORMAT_JPEG)]
+        audio.save()
+    elif ext == "flac":
+        audio = FLAC(path)
+        audio.add_picture(pic)
+        audio.save()
+    else:
+        audio = OggOpus(path)
+        audio["METADATA_BLOCK_PICTURE"] = base64.b64encode(pic.write()).decode(
+            "ascii")
+        audio.save()
 
 
 def cmd_identify(args, compress_result=None):
@@ -740,18 +780,19 @@ def cmd_identify(args, compress_result=None):
     files = [os.path.join(out_root, rel) for rel in manifest.values()]
     files = [f for f in files if os.path.exists(f)]
     if not files:
-        # No manifest, a manifest that points nowhere (output tree moved or
-        # wiped), or compress skipped everything as "bigger" so nothing was
-        # written yet. The output tree is the only thing we may ever tag,
-        # so identify whatever Ogg copies exist there (originaux jamais touchés).
+        # No manifest, or a manifest that points nowhere (output tree moved
+        # or wiped). The output tree is the only thing we may ever tag, so
+        # identify whatever audio copies exist there (originaux jamais touchés).
         files = [os.path.join(dirpath, fn)
                  for dirpath, _, fns in os.walk(out_root)
-                 for fn in fns if fn.lower().endswith((".opus", ".ogg"))]
+                 for fn in fns
+                 if os.path.splitext(fn)[1].lower().lstrip(".")
+                 in SUPPORTED_EXTENSIONS]
         files.sort()
         if not files:
             log("Aucune copie à identifier dans le dossier de sortie : rien n'a "
-                "été converti (déjà compressé, plus gros que l'original, ou "
-                "compress jamais lancé). Les originaux ne sont jamais retagués.")
+                "été converti ni copié (déjà compressé, ou compress jamais "
+                "lancé). Les originaux ne sont jamais retagués.")
             return
         log("(manifeste absent ou vide — identification de toutes les copies "
             "Ogg/Opus trouvées dans le dossier de sortie)")
@@ -789,16 +830,28 @@ def cmd_identify(args, compress_result=None):
                 + (f" — {album} ({date})" if album else ""))
             ok += 1
             continue
-        audio = OggOpus(path)
-        audio["TITLE"] = [title]
-        audio["ARTIST"] = [artist]
-        if album:
-            audio["ALBUM"] = [album]
-        if date:
-            audio["DATE"] = [date]
-        audio.save()
+        try:
+            audio = MutagenFile(path, easy=True)
+            if audio is None:
+                raise MutagenError("format non géré")
+            if audio.tags is None:
+                audio.add_tags()
+            audio["title"] = title
+            audio["artist"] = artist
+            if album:
+                audio["album"] = album
+            if date:
+                audio["date"] = date
+            audio.save()
+        except MutagenError as e:
+            log(f"      balises impossibles : {e}")
+            failed += 1
+            continue
         if cover:
-            set_cover(path, cover)
+            try:
+                set_cover(path, cover)
+            except (MutagenError, OSError) as e:
+                log(f"      pochette non écrite : {e}")
         log(f"      « {title} » — {artist}" + (f" — {album} ({date})" if album else "")
             + f"  (score {score:.2f}, Δ{delta}s, {time.monotonic() - t0:.1f} s)")
         ok += 1
