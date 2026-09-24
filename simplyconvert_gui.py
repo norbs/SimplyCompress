@@ -110,8 +110,7 @@ class App(tk.Tk):
 
         row(opts, 3, "Débit Ogg/Opus")
         self.br_var = tk.IntVar(value=160)
-        br_box = ttk.Combobox(opts, textvariable=self.br_var, state="readonly",
-                              values=[128, 160, 180, 320], width=22)
+        br_box = ttk.Combobox(opts, textvariable=self.br_var, state="readonly",                               values=[128, 160, 180, 256], width=22)
         br_box.grid(row=3, column=1, sticky="w", padx=6)
 
         self.auto_var = tk.BooleanVar(value=True)

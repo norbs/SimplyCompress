@@ -3,7 +3,7 @@
 
 Applies the SAME two engines as the app to a PC music folder:
 
-  compress   Re-encode the library to Ogg/Opus (libopus, 160/180/320 kbps),
+  compress   Re-encode the library to Ogg/Opus (libopus, 160/180/256 kbps),
              with the same rules as "Compress my music":
                - lossless sources always convert
                - lossy sources only convert if the result is smaller
@@ -53,7 +53,8 @@ from mutagen.oggopus import OggOpus
 # ----------------------------------------------------------------------------
 
 SUPPORTED_EXTENSIONS = {
-    "mp3", "ogg", "flac", "m4a", "aac", "alac",
+    "mp3", "mp2",                    # MPEG audio layers 2 & 3
+    "ogg", "flac", "m4a", "aac", "alac",
     "oga", "ogx", "opus",
     "wav", "riff", "bwf",
     "ac3", "eac3",
@@ -745,7 +746,7 @@ def set_cover(path: str, data: bytes):
     pic.desc = "Cover"
     pic.data = data
     ext = os.path.splitext(path)[1].lower().lstrip(".")
-    if ext == "mp3":
+    if ext in {"mp3", "mp2"}:
         tags = ID3(path)
         tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover",
                       data=data))
@@ -873,8 +874,7 @@ def main():
 
     p = sub.add_parser("compress", help="compresser la bibliothèque en Ogg/Opus")
     add_common(p)
-    p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE_KBPS,
-                   choices=[128, 160, 180, 320])
+    p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE_KBPS,                    choices=[128, 160, 180, 256])
     p.add_argument("--auto-volume", dest="auto_volume", action="store_true", default=True)
     p.add_argument("--no-auto-volume", dest="auto_volume", action="store_false")
     p.add_argument("--fast", action="store_true",
@@ -887,8 +887,7 @@ def main():
 
     p = sub.add_parser("compressidentify", help="compress puis identify (taggage + compression)")
     add_common(p)
-    p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE_KBPS,
-                   choices=[128, 160, 180, 320])
+    p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE_KBPS,                    choices=[128, 160, 180, 256])
     p.add_argument("--auto-volume", dest="auto_volume", action="store_true", default=True)
     p.add_argument("--no-auto-volume", dest="auto_volume", action="store_false")
     p.add_argument("--fast", action="store_true",
