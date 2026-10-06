@@ -68,7 +68,6 @@ MIN_GAIN = 0.178                 # -15 dB attenuation floor
 CLIP_GUARD = 0.98                # peak headroom after amplification
 
 DEFAULT_BITRATE_KBPS = 160
-BITRATE_SLACK = 24_000           # bit/s of tolerance in the lossy pre-filter
 
 ACOUSTID_CLIENT = "cSpUJKpD"     # same client key as the app
 ACOUSTID_URL = "https://api.acoustid.org/v2/lookup"
@@ -147,14 +146,6 @@ def is_lossless(path: str, ext: str, probe: dict) -> bool:
             return codec in {"alac", "flac", "pcm_s16le", "pcm_s24le",
                              "pcm_s32le", "pcm_f32le", "pcm_u8"}
     return False
-
-
-def source_bitrate(probe: dict):
-    br = probe.get("format", {}).get("bit_rate")
-    try:
-        return int(br) if br else None
-    except ValueError:
-        return None
 
 
 def duration_seconds(probe: dict) -> int:
@@ -294,24 +285,54 @@ def copy_tags_with_cover(src: str, opus_path: str, rg: tuple):
                 return v
         return None
 
-    mapping = {
-        "TITLE": ("title", "TITLE"),
-        "ARTIST": ("artist", "ARTIST"),
-        "ALBUM": ("album", "ALBUM"),
-        "ALBUMARTIST": ("album_artist", "ALBUMARTIST", "ALBUM ARTIST"),
-        "DATE": ("date", "DATE", "year", "TYER"),
-        "TRACKNUMBER": ("track", "TRCK", "track"),
-        "DISCNUMBER": ("disc", "TPOS", "disc"),
-        "GENRE": ("genre", "TCON"),
-        "COMPOSER": ("composer", "TCOM"),
-        "PUBLISHER": ("publisher", "TPUB", "label"),
+    # Mirror OpusTags.copyFromSource: preserve all Vorbis comments for
+    # FLAC/OGG sources (rather than a small tag subset), and the same known
+    # ID3-to-Vorbis mapping used on Android for MP3 input. ffprobe normalizes
+    # every container to format tags, so the fallback mapping handles other
+    # formats and fills keys not represented in the common alias table.
+    standard = {
+        "TITLE": ("title",),
+        "ARTIST": ("artist",),
+        "ALBUM": ("album",),
+        "ALBUMARTIST": ("album_artist", "albumartist", "album artist"),
+        "DATE": ("date", "year", "tyer"),
+        "TRACKNUMBER": ("track", "tracknumber", "trck"),
+        "TRACKTOTAL": ("tracktotal", "totaltracks"),
+        "DISCNUMBER": ("disc", "discnumber", "tpos"),
+        "DISCTOTAL": ("disctotal", "totaldiscs"),
+        "GENRE": ("genre", "tcon"),
+        "COMPOSER": ("composer", "tcom"),
+        "COMMENT": ("comment", "description", "comm"),
+        "BPM": ("bpm", "tbpm"),
+        "ISRC": ("isrc",),
+        "COPYRIGHT": ("copyright", "tcop"),
+        "LYRICS": ("lyrics", "unsy"),
+        "LABEL": ("label", "publisher", "tpub"),
+        "CATALOGNUMBER": ("catalognumber", "catalog number"),
+        "BARCODE": ("barcode",),
+        "ENCODER": ("encoded_by", "encoder", "tenc"),
     }
-    for dst_key, sources in mapping.items():
-        val = pick(*sources)
+    normalized = {str(k).lower(): v for k, v in fmt_tags.items()}
+    source_ext = os.path.splitext(src)[1].lower()
+    is_vorbis_source = source_ext in {".flac", ".ogg", ".oga", ".opus"}
+    handled = set()
+    for dst_key, aliases in standard.items():
+        val = next((normalized[a] for a in aliases if normalized.get(a)), None)
         if val:
             vals = dedupe([v.strip() for v in str(val).split(";") if v.strip()])
             if vals:
                 audio[dst_key] = vals
+                handled.update(aliases)
+
+    if is_vorbis_source:
+        # Keep custom Vorbis fields such as MUSICBRAINZ_* and vendor tags.
+        for key, value in fmt_tags.items():
+            key = str(key).strip().upper()
+            if not key or key in handled or key in {"METADATA_BLOCK_PICTURE", "COVERART", "COVERARTMIME"}:
+                continue
+            vals = dedupe([v.strip() for v in str(value).split(";") if v.strip()])
+            if vals and key not in audio:
+                audio[key] = vals
 
     # Cover art: first attached picture of the source, via ffmpeg → tmp jpg.
     pic_file = None
@@ -325,12 +346,38 @@ def copy_tags_with_cover(src: str, opus_path: str, rg: tuple):
             if r.returncode != 0:
                 pic_file = None
             break
+    if pic_file is None and is_vorbis_source:
+        # Cover art in FLAC/Ogg Vorbis comments is not always exposed by
+        # ffprobe as an attached picture; decode Mutagen's native artwork.
+        try:
+            source_audio = MutagenFile(src)
+            source_pictures = getattr(source_audio, "pictures", []) if source_audio else []
+            if source_pictures:
+                pic_file = os.path.join(_TMP_DIR, f"st_cover_{os.getpid()}.bin")
+                with open(pic_file, "wb") as out:
+                    out.write(source_pictures[0].data)
+        except (MutagenError, OSError):
+            pic_file = None
+    if pic_file is None:
+        # ID3 MP3 pictures may be hidden by ffprobe's attached_pic handling;
+        # use the same first-artwork rule as Android's jaudiotagger path.
+        try:
+            source_audio = MutagenFile(src)
+            source_tags = source_audio.tags if source_audio else None
+            artwork = source_tags.getall("APIC") if source_tags and hasattr(source_tags, "getall") else []
+            if artwork:
+                pic_file = os.path.join(_TMP_DIR, f"st_cover_{os.getpid()}.bin")
+                with open(pic_file, "wb") as out:
+                    out.write(artwork[0].data)
+        except (MutagenError, OSError):
+            pic_file = None
     if pic_file and os.path.getsize(pic_file) > 0:
         with open(pic_file, "rb") as f:
             data = f.read()
         pic = Picture()
         pic.type = 3  # front cover
-        pic.mime = "image/jpeg"
+        pic.mime = ("image/png" if data.startswith(b"\x89PNG\r\n\x1a\n")
+                    else "image/jpeg")
         pic.desc = "Cover"
         pic.data = data
         audio["METADATA_BLOCK_PICTURE"] = base64.b64encode(pic.write()).decode("ascii")
@@ -370,7 +417,7 @@ def cmd_compress(args) -> dict:
         f"{args.bitrate} kbps, "
         f"{'vitesse maximale' if getattr(args, 'fast', False) else 'priorité basse'})")
 
-    stats = {"converted": 0, "kept": 0, "prefilter": 0, "copied": 0, "failed": 0,
+    stats = {"converted": 0, "kept": 0, "copied": 0, "failed": 0,
              "dest_exists": 0}
     if not getattr(args, "fast", False):
         try:
@@ -400,13 +447,12 @@ def cmd_compress(args) -> dict:
             continue
         lossless = is_lossless(src, ext, probe)
 
-        # Pre-filter (app rule): lossy at/below target+slack can only grow…
-        if not lossless and not args.auto_volume:
-            br = source_bitrate(probe)
-            if br and br <= args.bitrate * 1000 + BITRATE_SLACK:
-                log(f"  [{i}/{len(files)}] déjà compressé, sauté : {rel_src}")
-                stats["prefilter"] += 1
-                continue
+        # No bitrate pre-filter, like the app: encode, then let the size gate
+        # below decide. Guessing from a probed bitrate trusts a duration tag
+        # that is often wrong (this sample has an MP3 of 278 s announcing
+        # 1500 s, which probes as 32 kbps) and cannot know where the encode
+        # lands. The manifest and the destination guard keep repeat runs
+        # from re-encoding what was already decided.
 
         # Destination guard: "Title.ogg" (previous conversion) or a previous
         # copy of the original under its own extension already there? Skip —
@@ -478,7 +524,7 @@ def cmd_compress(args) -> dict:
     elapsed = time.monotonic() - t_start
     log(f"\nRésumé : {stats['converted']} convertis, {stats['copied']} originaux copiés "
         f"(résultat plus gros), {stats['kept']} déjà à jour, "
-        f"{stats['prefilter']} sautés (déjà compressés), {stats['dest_exists']} sautés "
+        f"{stats['dest_exists']} sautés "
         f"(destination présente), {stats['failed']} échecs — {elapsed:.1f} s"
         + (f" ({elapsed / stats['converted']:.1f} s/morceau)" if stats["converted"] else ""))
     log(f"Espace : {total_src // (1024 * 1024)} Mo → {total_out // (1024 * 1024)} Mo "
@@ -595,145 +641,108 @@ def pick_candidate(root: dict, duration: int):
     if not cands:
         return None
 
-    def has_primary(rec: dict) -> bool:
-        # Any release-group AcoustID does not flag as compilation/live/etc.
-        # (missing type data counts as unknown, i.e. possibly primary).
-        return any(not (g.get("secondary-types") or g.get("secondarytypes"))
-                   for g in rec.get("releasegroups", []) or [])
-
-    cands.sort(key=lambda c: (0 if c[1] <= DURATION_SLACK_SEC else 1, -c[0],
-                              0 if has_primary(c[4]) else 1, c[1]))
+    # Exactly TagFetcher.kt: duration-consistent results first, then score,
+    # then duration delta. Release-group type does not affect track matching.
+    cands.sort(key=lambda c: (0 if c[1] <= DURATION_SLACK_SEC else 1, -c[0], c[1]))
     return cands[0]
 
 
-def fetch_album_info(rec: dict, acoustid_root: dict | None = None) -> tuple:
-    """(album, date, cover_bytes|None) via MusicBrainz + Cover Art Archive.
+def fetch_album_info(
+    rec: dict,
+    *,
+    needs_year: bool = True,
+    needs_genre: bool = True,
+) -> tuple:
+    """Return (album, Android-style year, Android-style genre, cover bytes).
 
-    The release-groups AcoustID nests in a recording are unreliable for old
-    hits: mostly compilations, dates almost never filled, order arbitrary —
-    taking the first "non-secondary" one once tagged Joe Dassin's L'Été
-    indien with a random compilation (« A French Affair ») instead of the
-    1974 single. So instead:
-      1. collect the groups of every recording of the best result (the
-         original single/album often hangs on a sibling recording, and
-         MusicBrainz's own browse sometimes only exposes compilations),
-      2. merge the groups MusicBrainz itself links to the recording
-         (authoritative types/dates) with the AcoustID ones,
-      3. verify the primary-looking ones on MusicBrainz one by one
-         (release-group lookup: real types + first-release-date) and keep
-         the first that is neither compilation nor live/etc. — the original
-         release — falling back to the earliest dated group of any kind when
-         the track only ever appeared on compilations (same rule as
-         TagFetcher.kt).
+    Selection and enrichment mirror TagFetcher.kt: choose the earliest dated
+    non-secondary AcoustID release group (or earliest group of any type if
+    there is no primary group), then use that group's MusicBrainz record only
+    for missing year/genre fields. The genre selection matches TagFetcher.pickGenre.
     """
-    rec_id = rec.get("id") or ""
-    acoustid_groups, seen_ids = [], set()
-    recs = [rec]
-    if acoustid_root:
-        recs += [r for res in acoustid_root.get("results", []) or []
-                 for r in res.get("recordings", []) or []]
-    for r in recs:
-        for g in r.get("releasegroups", []) or []:
-            if g.get("id") and g["id"] not in seen_ids:
-                seen_ids.add(g["id"])
-                acoustid_groups.append(g)
+    groups = rec.get("releasegroups") or []
+    primary = [g for g in groups if not (
+        g.get("secondary-types") or g.get("secondarytypes"))]
+    pool = primary or groups
+    best = min(pool, key=lambda g: g.get("first-release-date") or "9999") \
+        if pool else None
+    if best is None:
+        return None, "", "", None
 
-    browse_groups = []
-    if rec_id:
+    group_id = (best.get("id") or "").strip()
+    album = (best.get("title") or "").strip()
+    raw_date = (best.get("first-release-date") or "").strip()
+    year = raw_date[:4] if len(raw_date) >= 4 and raw_date[:4].isdigit() else ""
+    genre = ""
+
+    # AcoustID often omits the date and does not carry genres. Android asks
+    # MusicBrainz only for fields missing from the source audio.
+    if group_id and (needs_year or needs_genre):
         try:
-            data = http_get_json(
-                f"https://musicbrainz.org/ws/2/release?recording={rec_id}"
-                f"&inc=release-groups&fmt=json&limit=100")
-            seen = set()
-            for rel in data.get("releases", []) or []:
-                g = dict(rel.get("release-group") or {})
-                gid = g.get("id")
-                if not gid or gid in seen:
-                    continue
-                seen.add(gid)
-                g["secondary-types"] = g.get("secondary-types") or []
-                browse_groups.append(g)
-        except (OSError, json.JSONDecodeError):
-            pass  # MusicBrainz unreachable: fall back to the AcoustID groups
-
-    def sec_of(g: dict) -> list:
-        return g.get("secondary-types") or g.get("secondarytypes") or []
-
-    def primary_type_ok(info: dict) -> bool:
-        # MusicBrainz exposes primary-type (str) and secondary-types (list).
-        pt = info.get("primary-types") or ([info["primary-type"]]
-                                           if info.get("primary-type") else [])
-        return not pt or any(t in ("Album", "Single", "EP") for t in pt)
-
-    # Groups worth verifying: those AcoustID does not already flag as
-    # compilation/live/etc. AcoustID's type is often absent, so rank known
-    # albums first, unknown next, singles last; dated groups (rare) first
-    # within a class, then MusicBrainz browse entries before AcoustID ones.
-    def rank(g: dict):
-        order = {"Album": 0, "Single": 2}.get(g.get("type") or "", 1)
-        return (order,
-                0 if g.get("first-release-date") else 1,
-                g.get("first-release-date") or "",
-                0 if g in browse_groups else 1)
-
-    cand_ids, candidates = set(), []
-    for g in browse_groups + acoustid_groups:
-        gid = g.get("id")
-        if not gid or gid in cand_ids or sec_of(g):
-            continue
-        cand_ids.add(gid)
-        candidates.append(g)
-    candidates.sort(key=rank)
-
-    winner = None
-    verified = []  # MB info of everything checked — compilation-only fallback
-    for g in candidates[:8]:
-        try:
-            info = http_get_json(
-                f"https://musicbrainz.org/ws/2/release-group/{g['id']}?fmt=json")
-        except (OSError, json.JSONDecodeError):
-            continue
-        verified.append(info)
-        if not (info.get("secondary-types") or []) and primary_type_ok(info):
-            winner = info
-            break
-
-    if winner is not None:
-        gid = winner.get("id")
-        date = winner.get("first-release-date") or None
-        winner_primary = (winner.get("primary-types")
-                          or ([winner["primary-type"]] if winner.get("primary-type") else []))
-        if winner_primary == ["Single"]:
-            # A-side/B-side single titles are noisy (« X (Y) / Z »): a
-            # standalone single reads better under the track's own name.
-            album = (rec.get("title") or winner.get("title") or "").strip()
-        else:
-            album = (winner.get("title") or "").strip()
-    else:
-        # Nothing verifiable turned out non-compilation: earliest dated group
-        # of any kind (canonical album, like the app); list order when no date.
-        pool = [info for info in verified if info.get("id")]
-        pool += browse_groups + acoustid_groups
-        best = min(pool, key=lambda g: g.get("first-release-date") or "9999") \
-            if pool else None
-        if not best:
-            return None, None, None
-        gid = best.get("id")
-        album = best.get("title")
-        date = best.get("first-release-date") or None
+            # Android requests both genre sources even when only year is
+            # missing; keep its MusicBrainz endpoint/query identical.
+            query = "?fmt=json&inc=genres%2Btags"
+            extras = http_get_json(
+                "https://musicbrainz.org/ws/2/release-group/"
+                f"{urllib.parse.quote(group_id, safe='')}{query}")
+            if needs_year:
+                extra_date = (extras.get("first-release-date") or "").strip()
+                if len(extra_date) >= 4 and extra_date[:4].isdigit():
+                    year = extra_date[:4]
+            if needs_genre:
+                genre = pick_android_genre(extras.get("genres") or [],
+                                          extras.get("tags") or [])
+        except (OSError, json.JSONDecodeError) as e:
+            log(f"      MusicBrainz extras indisponibles : {e}")
 
     cover = None
-    if gid:
+    if group_id:
         try:
             req = urllib.request.Request(
-                f"https://coverartarchive.org/release-group/{gid}/front-500",
+                f"https://coverartarchive.org/release-group/{urllib.parse.quote(group_id, safe='')}/front-250",
                 headers={"User-Agent": MB_UA})
             with urllib.request.urlopen(req, timeout=20) as resp:
                 if resp.status == 200 and resp.headers.get_content_type().startswith("image/"):
                     cover = resp.read()
         except OSError:
             pass
-    return album, date, cover
+    return album, year, genre, cover
+
+
+def pick_android_genre(genres: list[dict], tags: list[dict]) -> str:
+    """Match TagFetcher.pickGenre: best curated genre, then clean folksonomy."""
+    def best_vote(entries: list[dict]) -> str:
+        best_name, best_count = "", None
+        for entry in entries:
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            count = entry.get("count", 0)
+            try:
+                count = int(count)
+            except (TypeError, ValueError):
+                count = 0
+            if best_count is None or count > best_count:
+                best_name, best_count = name, count
+        return best_name
+
+    curated = best_vote(genres)
+    if curated:
+        return curated
+
+    import re
+    decade = re.compile(r"^\d{2,4}'?s?$", re.IGNORECASE)
+    usable = []
+    for entry in tags:
+        name = str(entry.get("name") or "").strip()
+        if not name or len(name) > 40:
+            continue
+        if any(c in name for c in "/\\|") or not any(c.isalpha() for c in name):
+            continue
+        if decade.fullmatch(name) or len(name.split()) > 3:
+            continue
+        usable.append(entry)
+    return best_vote(usable)
 
 
 def set_cover(path: str, data: bytes):
@@ -806,7 +815,6 @@ def cmd_identify(args, compress_result=None):
         name = os.path.relpath(path, out_root)
         probe = ffprobe_json(path)
         dur = duration_seconds(probe)
-        existing_title = (probe.get("format", {}).get("tags", {}) or {}).get("title", "")
         log(f"  [{i}/{len(files)}] {name}")
         t0 = time.monotonic()
         try:
@@ -825,10 +833,22 @@ def cmd_identify(args, compress_result=None):
             no_match += 1
             continue
         score, delta, artist, title, rec = best
-        album, date, cover = fetch_album_info(rec, root)
+        # Android only requests MusicBrainz year/genre data when those fields
+        # are missing on the source. Keep existing values when absent online.
+        try:
+            current_audio = MutagenFile(path, easy=True)
+            current_tags = current_audio.tags or {} if current_audio is not None else {}
+        except (MutagenError, OSError):
+            current_tags = {}
+        needs_year = not bool(current_tags.get("date") or current_tags.get("year"))
+        needs_genre = not bool(current_tags.get("genre"))
+        album, year, genre, cover = fetch_album_info(
+            rec, needs_year=needs_year, needs_genre=needs_genre,
+        )
         if args.dry_run:
             log(f"      (dry-run) « {title} » — {artist}"
-                + (f" — {album} ({date})" if album else ""))
+                + (f" — {album} ({year})" if album else "")
+                + (f" — {genre}" if genre else ""))
             ok += 1
             continue
         try:
@@ -841,19 +861,25 @@ def cmd_identify(args, compress_result=None):
             audio["artist"] = artist
             if album:
                 audio["album"] = album
-            if date:
-                audio["date"] = date
+            if year:
+                audio["date"] = year
+            if genre:
+                audio["genre"] = genre
             audio.save()
         except MutagenError as e:
             log(f"      balises impossibles : {e}")
             failed += 1
             continue
-        if cover:
+        # Android updates embedded artwork only for Opus, whose custom writer
+        # is Android-safe. Its jaudiotagger path intentionally writes text only
+        # for MP3/FLAC/Vorbis; mirror that here rather than altering their art.
+        if cover and isinstance(audio, OggOpus):
             try:
                 set_cover(path, cover)
             except (MutagenError, OSError) as e:
                 log(f"      pochette non écrite : {e}")
-        log(f"      « {title} » — {artist}" + (f" — {album} ({date})" if album else "")
+        log(f"      « {title} » — {artist}" + (f" — {album} ({year})" if album else "")
+            + (f" — {genre}" if genre else "")
             + f"  (score {score:.2f}, Δ{delta}s, {time.monotonic() - t0:.1f} s)")
         ok += 1
     log(f"\nIdentification : {ok} tagués, {no_match} sans correspondance, {failed} échecs"
