@@ -62,6 +62,13 @@ SUPPORTED_EXTENSIONS = {
 }
 LOSSLESS_EXTENSIONS = {"flac", "wav", "riff", "bwf", "alac"}
 
+# Fichiers non-audio recopiés tels quels (même nom, même arbre relatif,
+# écrasement si la destination existe) — voir cmd_compress.
+COPY_AS_IS_EXTENSIONS = {
+    "jpg", "jpeg", "txt", "doc", "docx",
+    "odt", "xls", "xlsx", "ods",
+}
+
 RG_REFERENCE_RMS = 6537.0        # s16 RMS of the 89 dB reference (app value)
 MAX_GAIN = 3.981                 # +12 dB amplification ceiling
 MIN_GAIN = 0.178                 # -15 dB attenuation floor
@@ -253,8 +260,15 @@ def compute_gain(rms: float, peak: float) -> float:
 
 def convert_to_ogg(src: str, dst_tmp: str, kbps: int):
     """Decode -> libopus Ogg. Tags/cover are copied afterwards by mutagen."""
+    # -map_metadata -1: without it ffmpeg copies EVERY source comment into the
+    # new file, and mutagen then adds the contract's canonical spelling next to
+    # it — that is where `publisher`+`label`, `album artist`+`albumartist`,
+    # `description`+`comment` and a dozen MP3-only frames (TLEN, CDBB DISCID,
+    # PERFORMER…) came from. The output must carry exactly what the tag writer
+    # decides (TAG_CONTRACT §8.2).
     cmd = ["ffmpeg", "-y", "-v", "error", "-i", src, "-map", "0:a:0",
-           "-vn", "-c:a", "libopus", "-b:a", f"{kbps}k", "-f", "ogg", dst_tmp]
+           "-map_metadata", "-1", "-vn", "-c:a", "libopus", "-b:a", f"{kbps}k",
+           "-f", "ogg", dst_tmp]
     r = subprocess.run(cmd, capture_output=True, text=True,
                        encoding="utf-8", errors="replace",
                        creationflags=_subprocess_flags())
@@ -271,71 +285,101 @@ def dedupe(values):
     return out
 
 
-def copy_tags_with_cover(src: str, opus_path: str, rg: tuple):
-    """Copy source tags + cover art onto the Opus copy (mutagen), then add
-    the ReplayGain comments exactly like OpusTags.writeReplayGainComments."""
-    audio = OggOpus(opus_path)
-    src_probe = ffprobe_json(src)
-    fmt_tags = src_probe.get("format", {}).get("tags", {}) or {}
+def _tag_values(val) -> list:
+    """Normalize one source value into the list written to the Opus copy.
 
-    def pick(*keys):
-        for k in keys:
-            v = fmt_tags.get(k)
-            if v:
-                return v
+    TAG_CONTRACT §9: trim only — a value stays a value. No ';' splitting, no
+    dedupe, no reformatting: Android copies fields verbatim, and any transform
+    here is a guaranteed divergence between the two pipelines.
+    """
+    if val is None:
+        return []
+    if isinstance(val, (list, tuple)):
+        items = list(val)
+    else:
+        # mutagen ID3 frames carry their text in `.text`, not in `str(frame)`.
+        text = getattr(val, "text", None)
+        items = list(text) if isinstance(text, (list, tuple)) else [val]
+    out = []
+    for item in items:
+        s = str(item).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _source_comments(src: str) -> dict:
+    """Source tags as stored, lowercased keys (TAG_CONTRACT §3.4).
+
+    ffprobe renames ALBUMARTIST/TRACKNUMBER/DISCNUMBER to its own spelling and
+    collapses two spellings of one field into whichever it read last — a value
+    is silently lost. mutagen reads the comment block as stored (every spelling
+    survives), which is what the alias table and the verbatim copy need. Keys
+    come back lowercased, the spelling the contract writes (§8.1).
+    """
+    try:
+        mf = MutagenFile(src)
+    except Exception:
+        return {}
+    tags = getattr(mf, "tags", None) if mf is not None else None
+    if tags is None or not hasattr(tags, "keys"):
+        return {}
+    out = {}
+    for k in tags.keys():
+        try:
+            values = _tag_values(tags[k])
+        except Exception:
+            continue
+        if values:
+            out[str(k).strip().lower()] = values
+    return out
+
+
+def _source_picture(src: str):
+    """First embedded artwork of *src*, as raw bytes (TAG_CONTRACT §6).
+
+    Straight copy of the bytes already sitting in the file: no decode, no
+    re-encode, no temp file.
+    """
+    try:
+        mf = MutagenFile(src)
+    except Exception:
         return None
+    if mf is None:
+        return None
+    pictures = getattr(mf, "pictures", None) or []
+    if pictures:
+        data = getattr(pictures[0], "data", None)
+        if data:
+            return bytes(data)
+    tags = getattr(mf, "tags", None)
+    if tags is None:
+        return None
+    # FLAC / Ogg: METADATA_BLOCK_PICTURE comment
+    try:
+        raw = tags.get("metadata_block_picture") if hasattr(tags, "get") else None
+        if raw:
+            pic = Picture(base64.b64decode(raw[0]))
+            if pic.data:
+                return bytes(pic.data)
+    except Exception:
+        pass
+    # ID3: APIC
+    try:
+        artwork = tags.getall("APIC") if hasattr(tags, "getall") else []
+        if artwork and artwork[0].data:
+            return bytes(artwork[0].data)
+    except Exception:
+        pass
+    return None
 
-    # Mirror OpusTags.copyFromSource: preserve all Vorbis comments for
-    # FLAC/OGG sources (rather than a small tag subset), and the same known
-    # ID3-to-Vorbis mapping used on Android for MP3 input. ffprobe normalizes
-    # every container to format tags, so the fallback mapping handles other
-    # formats and fills keys not represented in the common alias table.
-    standard = {
-        "TITLE": ("title",),
-        "ARTIST": ("artist",),
-        "ALBUM": ("album",),
-        "ALBUMARTIST": ("album_artist", "albumartist", "album artist"),
-        "DATE": ("date", "year", "tyer"),
-        "TRACKNUMBER": ("track", "tracknumber", "trck"),
-        "TRACKTOTAL": ("tracktotal", "totaltracks"),
-        "DISCNUMBER": ("disc", "discnumber", "tpos"),
-        "DISCTOTAL": ("disctotal", "totaldiscs"),
-        "GENRE": ("genre", "tcon"),
-        "COMPOSER": ("composer", "tcom"),
-        "COMMENT": ("comment", "description", "comm"),
-        "BPM": ("bpm", "tbpm"),
-        "ISRC": ("isrc",),
-        "COPYRIGHT": ("copyright", "tcop"),
-        "LYRICS": ("lyrics", "unsy"),
-        "LABEL": ("label", "publisher", "tpub"),
-        "CATALOGNUMBER": ("catalognumber", "catalog number"),
-        "BARCODE": ("barcode",),
-        "ENCODER": ("encoded_by", "encoder", "tenc"),
-    }
-    normalized = {str(k).lower(): v for k, v in fmt_tags.items()}
-    source_ext = os.path.splitext(src)[1].lower()
-    is_vorbis_source = source_ext in {".flac", ".ogg", ".oga", ".opus"}
-    handled = set()
-    for dst_key, aliases in standard.items():
-        val = next((normalized[a] for a in aliases if normalized.get(a)), None)
-        if val:
-            vals = dedupe([v.strip() for v in str(val).split(";") if v.strip()])
-            if vals:
-                audio[dst_key] = vals
-                handled.update(aliases)
 
-    if is_vorbis_source:
-        # Keep custom Vorbis fields such as MUSICBRAINZ_* and vendor tags.
-        for key, value in fmt_tags.items():
-            key = str(key).strip().upper()
-            if not key or key in handled or key in {"METADATA_BLOCK_PICTURE", "COVERART", "COVERARTMIME"}:
-                continue
-            vals = dedupe([v.strip() for v in str(value).split(";") if v.strip()])
-            if vals and key not in audio:
-                audio[key] = vals
+def _picture_via_ffmpeg(src: str, src_probe: dict):
+    """Last resort for an attached picture mutagen cannot see (§6).
 
-    # Cover art: first attached picture of the source, via ffmpeg → tmp jpg.
-    pic_file = None
+    Kept as a fallback only: `ffmpeg -frames:v 1` re-encodes the image, so it
+    must never run on a source whose artwork mutagen can read.
+    """
     for st in src_probe.get("streams", []):
         if st.get("codec_type") == "video" and st.get("disposition", {}).get("attached_pic"):
             pic_file = os.path.join(_TMP_DIR, f"st_cover_{os.getpid()}.jpg")
@@ -343,54 +387,170 @@ def copy_tags_with_cover(src: str, opus_path: str, rg: tuple):
                 ["ffmpeg", "-y", "-v", "error", "-i", src,
                  "-map", f"0:{st['index']}", "-frames:v", "1", pic_file],
                 capture_output=True, creationflags=_subprocess_flags())
-            if r.returncode != 0:
-                pic_file = None
-            break
-    if pic_file is None and is_vorbis_source:
-        # Cover art in FLAC/Ogg Vorbis comments is not always exposed by
-        # ffprobe as an attached picture; decode Mutagen's native artwork.
-        try:
-            source_audio = MutagenFile(src)
-            source_pictures = getattr(source_audio, "pictures", []) if source_audio else []
-            if source_pictures:
-                pic_file = os.path.join(_TMP_DIR, f"st_cover_{os.getpid()}.bin")
-                with open(pic_file, "wb") as out:
-                    out.write(source_pictures[0].data)
-        except (MutagenError, OSError):
-            pic_file = None
-    if pic_file is None:
-        # ID3 MP3 pictures may be hidden by ffprobe's attached_pic handling;
-        # use the same first-artwork rule as Android's jaudiotagger path.
-        try:
-            source_audio = MutagenFile(src)
-            source_tags = source_audio.tags if source_audio else None
-            artwork = source_tags.getall("APIC") if source_tags and hasattr(source_tags, "getall") else []
-            if artwork:
-                pic_file = os.path.join(_TMP_DIR, f"st_cover_{os.getpid()}.bin")
-                with open(pic_file, "wb") as out:
-                    out.write(artwork[0].data)
-        except (MutagenError, OSError):
-            pic_file = None
-    if pic_file and os.path.getsize(pic_file) > 0:
-        with open(pic_file, "rb") as f:
-            data = f.read()
+            if r.returncode == 0 and os.path.getsize(pic_file) > 0:
+                with open(pic_file, "rb") as fh:
+                    data = fh.read()
+                try:
+                    os.remove(pic_file)
+                except OSError:
+                    pass
+                return data
+            try:
+                os.remove(pic_file)
+            except OSError:
+                pass
+            return None
+    return None
+
+
+# Source spelling (lowercase) → contract canonical key (TAG_CONTRACT §3.2,
+# plus the extra ID3 frames Android's FieldKey list maps onto the same
+# fields — see §11). Every write path goes through this table, so two
+# spellings can never produce two keys (§8.2).
+_ALIASES = {
+    # Vorbis / generic spellings (§3.2)
+    "album_artist": "albumartist",
+    "album artist": "albumartist",
+    "track": "tracknumber",
+    "disc": "discnumber",
+    "publisher": "label",           # §12 décision 1 : `label`, jamais les deux
+    "year": "date",
+    "originaldate": "date",
+    "description": "comment",
+    "catalog number": "catalognumber",
+    # ID3 frame ids (§3.2)
+    "trck": "tracknumber",
+    "tpos": "discnumber",
+    "tpub": "label",
+    "tyer": "date",
+    "tdrc": "date",
+    "tcon": "genre",
+    "tcom": "composer",
+    "comm": "comment",
+    "tbpm": "bpm",
+    "tcop": "copyright",
+    "unsy": "lyrics",
+    "talb": "album",
+    "tpe1": "artist",
+    "tit2": "title",
+    # Extra ID3 frames jaudiotagger routes through the same FieldKeys on
+    # Android (§11) — without these the value would be dropped on Linux
+    # only, e.g. TSRC → isrc (measured on `11. Chicago`, §12).
+    "tpe2": "albumartist",
+    "tsrc": "isrc",
+    "uslt": "lyrics",
+    "totaltracks": "tracktotal",
+    "totaldiscs": "disctotal",
+}
+
+# Exactly what OpusTags.STANDARD_KEYS writes for an ID3-style source: an
+# MP3 copy must carry the same (closed) key set as the Android one — no
+# TIT1/TIT3/TPE3/MCDI frame may leak through (§4).
+_ID3_WRITABLE = {
+    "title", "artist", "album", "albumartist", "date", "genre", "tracknumber",
+    "tracktotal", "discnumber", "disctotal", "composer", "comment", "bpm",
+    "isrc", "copyright", "lyrics", "label", "catalognumber", "barcode",
+    "encoder",
+}
+
+
+def _id3_key(key: str) -> str:
+    """mutagen ID3 frame id → canonical key: `TXXX:BARCODE` → `barcode`,
+    `COMM::eng` → `comment`, `TSRC` → `isrc` (then the §3.2 alias table)."""
+    k = key.strip().lower()
+    if k.startswith("txxx:"):
+        k = k[5:].strip()       # the TXXX description carries the meaning
+    else:
+        k = k.split(":", 1)[0]  # comm::eng → comm, uslt:... → uslt, apic:cover → apic
+    return _ALIASES.get(k, k)
+
+
+def copy_tags_with_cover(src: str, opus_path: str, rg: tuple):
+    """Copy source tags + cover art onto the Opus copy (mutagen), then add
+    the ReplayGain comments exactly like OpusTags.writeReplayGainComments."""
+    audio = OggOpus(opus_path)
+    src_probe = ffprobe_json(src)
+    # §3.4: mutagen is the tag reader (every spelling of a field survives);
+    # ffprobe stays the technical probe (streams, attached picture) and is
+    # used as the tag view only for containers mutagen names in fourcc form
+    # (M4A '\xa9nam'…), where its generic lowercase names are the practical
+    # spelling. Merging the two views would double every field — ffprobe
+    # renames `TSRC`→… while mutagen keeps `tsrc`, and both would alias to
+    # `isrc` (§8.2, §9 no-dedupe makes such a copy visible as a duplicate).
+    source_ext = os.path.splitext(src)[1].lower()
+    is_vorbis_source = source_ext in {".flac", ".ogg", ".oga", ".opus"}
+    is_id3_source = source_ext in {".mp3", ".mp2"}
+    if is_vorbis_source or is_id3_source:
+        view = _source_comments(src)
+    else:
+        view = {str(k).lower(): _tag_values(v)
+                for k, v in (src_probe.get("format", {}).get("tags", {}) or {}).items()}
+
+    # One pass, one canonical key per field: §8.2 (no second spelling of a
+    # key already written), §3.3 (values of two spellings of one family are
+    # appended — one key, N values, nothing overwritten), §9 (trim only,
+    # no ';' split, no dedupe).
+    entries: dict = {}
+    for key, value in view.items():
+        k = str(key).strip().lower()
+        if not k or k in {"metadata_block_picture", "coverart", "coverartmime"}:
+            continue
+        if is_vorbis_source:
+            if k == "vendor":  # §4: header string of the comment block, never a comment
+                continue
+            canon = _ALIASES.get(k, k)
+        else:
+            canon = _id3_key(k) if is_id3_source else _ALIASES.get(k, k)
+            if canon not in _ID3_WRITABLE:
+                continue
+        vals = _tag_values(value)
+        if not vals:
+            continue
+        if is_id3_source:
+            # ID3-style containers are read by jaudiotagger on Android, which
+            # resolves ONE value per FieldKey: the first frame of a family
+            # wins (two COMM descriptions must not double `comment`), and the
+            # ID3 "N/M" number form is split into number + total
+            # (FieldKey.TRACK/TRACK_TOTAL) — the app writes `tracknumber=6`
+            # + `tracktotal=9`, never `6/9`. Mirror that here so both sides
+            # write the same keys with the same values (§5, §8.2).
+            if canon in entries:
+                continue
+            if canon in ("tracknumber", "discnumber"):
+                num, _, total = vals[0].partition("/")
+                num, total = num.strip(), total.strip()
+                if num:
+                    entries[canon] = [num]
+                if total:
+                    entries["tracktotal" if canon == "tracknumber" else "disctotal"] = [total]
+                continue
+            entries[canon] = vals
+        else:
+            entries.setdefault(canon, []).extend(vals)
+
+    for canon, vals in entries.items():
+        audio[canon] = vals
+
+    # Cover art (§6): copy the source image BYTES. The old path ran ffmpeg
+    # `-frames:v 1`, which re-encodes the picture (250,013 o → 42,007 o on the
+    # reference file) and discards quality for nothing. mutagen reads the
+    # artwork straight out of the file — no decode, no temp file; ffmpeg stays
+    # only as a fallback for pictures mutagen cannot see.
+    data = _source_picture(src) or _picture_via_ffmpeg(src, src_probe)
+    if data:
         pic = Picture()
         pic.type = 3  # front cover
         pic.mime = ("image/png" if data.startswith(b"\x89PNG\r\n\x1a\n")
                     else "image/jpeg")
-        pic.desc = "Cover"
+        pic.desc = ""   # same picture block as Android's (§6, décision 2)
         pic.data = data
-        audio["METADATA_BLOCK_PICTURE"] = base64.b64encode(pic.write()).decode("ascii")
-        try:
-            os.remove(pic_file)
-        except OSError:
-            pass
+        audio["metadata_block_picture"] = base64.b64encode(pic.write()).decode("ascii")
 
     if rg:
         gain, peak = rg
         db = 20.0 * (np.log10(gain) if gain > 0 else 0.0)
-        audio["REPLAYGAIN_TRACK_GAIN"] = [f"{db:+.2f} dB"]
-        audio["REPLAYGAIN_TRACK_PEAK"] = [f"{peak / 32767.0:.6f}"]
+        audio["replaygain_track_gain"] = [f"{db:+.2f} dB"]
+        audio["replaygain_track_peak"] = [f"{peak / 32767.0:.6f}"]
 
     audio.save()
 
@@ -398,6 +558,30 @@ def copy_tags_with_cover(src: str, opus_path: str, rg: tuple):
 # ----------------------------------------------------------------------------
 # compress command
 # ----------------------------------------------------------------------------
+
+
+def _walk_meta_files(root: str, out_root: str):
+    """Yield (abs_path, rel_dir, stem, ext) for every file whose extension is
+    in COPY_AS_IS_EXTENSIONS. Used by cmd_compress to recopy jpg/png/txt/doc/
+    docx/odt/xls/xlsx/ods as-is (no conversion, no retagging, overwrite on clash).
+    Mirrors walk_library's exclude rules (skip hidden dirs, and skip the output
+    tree when it overlaps the source tree).
+    """
+    out_real = os.path.realpath(out_root) if out_root else ""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if not d.startswith(".")
+            and (not out_real or os.path.realpath(os.path.join(dirpath, d)) != out_real)
+        )
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == ".":
+            rel_dir = ""
+        for fn in sorted(filenames):
+            stem, ext = os.path.splitext(fn)
+            if ext[1:].lower() in COPY_AS_IS_EXTENSIONS:
+                yield os.path.join(dirpath, fn), rel_dir, stem, ext[1:].lower()
+
 
 def cmd_compress(args) -> dict:
     src_root = os.path.abspath(args.source)
@@ -514,6 +698,16 @@ def cmd_compress(args) -> dict:
             f"{'-' if saved >= 0 else '+'}{abs(saved) // 1024} ko, "
             f"{time.monotonic() - t0:.1f} s)")
 
+    # Recopie exacte des fichiers annexes (jpg/jpeg/png/txt/doc/docx/odt/xls/
+    # xlsx/ods) dans la sortie, même nom, écrasement si présent.
+    meta_list: list[str] = []
+    for (src_meta, rel_dir, stem, ext) in _walk_meta_files(src_root, out_root):
+        out_dir = os.path.join(out_root, rel_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        dst = os.path.join(out_dir, f"{stem}.{ext}")
+        shutil.copy2(src_meta, dst)
+        meta_list.append(os.path.relpath(dst, out_root))
+
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1, ensure_ascii=False)
 
@@ -529,6 +723,18 @@ def cmd_compress(args) -> dict:
         + (f" ({elapsed / stats['converted']:.1f} s/morceau)" if stats["converted"] else ""))
     log(f"Espace : {total_src // (1024 * 1024)} Mo → {total_out // (1024 * 1024)} Mo "
         f"(gagné : {(total_src - total_out) // (1024 * 1024)} Mo)")
+
+    if meta_list:
+        max_show = 50
+        shown = sorted(meta_list)[:max_show]
+        if len(meta_list) <= max_show:
+            log(f"\nFichiers annexe(s) recopié(s) telle quelle(s) : {len(meta_list)} ->\n    "
+                + "\n    ".join(shown))
+        else:
+            log(f"\nFichiers annexe(s) recopié(s) telle quelle(s) : {len(meta_list)} "
+                f"(liste tronquée aux 50 premiers) ->\n    "
+                + "\n    ".join(shown))
+
     return {"out_root": out_root, "manifest": manifest}
 
 
@@ -775,6 +981,38 @@ def set_cover(path: str, data: bytes):
         audio.save()
 
 
+def needs_identification(path: str) -> bool:
+    """True when "identify" has something to fill in on this file.
+
+    Exact mirror of Track.needsIdentification() on Android: identification
+    writes artist, title, album, year and genre, so a file counts as pending
+    as soon as ONE of them is missing. A fully tagged file is therefore
+    never sent to AcoustID/MusicBrainz — no fingerprint, no request — which
+    is what keeps repeat runs offline (parity with the app's "Identify
+    songs" target filter).
+    """
+    try:
+        audio = MutagenFile(path, easy=True)
+        tags = audio.tags if audio is not None else None
+    except (MutagenError, OSError):
+        tags = None
+    if not tags:
+        return True
+
+    def present(*keys):
+        for k in keys:
+            v = tags.get(k)
+            if v is None:
+                continue
+            items = v if isinstance(v, (list, tuple)) else [v]
+            if any(str(it).strip() for it in items):
+                return True
+        return False
+
+    return not (present("title") and present("artist") and present("album")
+                and present("date", "year") and present("genre"))
+
+
 def cmd_identify(args, compress_result=None):
     """Identify + tag. ONLY the compressed copies are ever written."""
     if compress_result:
@@ -806,16 +1044,30 @@ def cmd_identify(args, compress_result=None):
             return
         log("(manifeste absent ou vide — identification de toutes les copies "
             "Ogg/Opus trouvées dans le dossier de sortie)")
+    # Offline short-circuit (mirror of Track.needsIdentification): a copy
+    # that already carries artist/title/album/year/genre needs nothing from
+    # the network. Filtered BEFORE find_fpcalc, so a fully tagged tree
+    # requires neither fpcalc nor connectivity at all.
+    pending = [f for f in files if needs_identification(f)]
+    already_tagged = len(files) - len(pending)
+    if already_tagged:
+        log(f"\n{already_tagged} copie(s) déjà taguée(s) — ignorées, "
+            "aucun téléchargement")
+    if not pending:
+        log("Rien à identifier : toutes les copies portent déjà artiste, "
+            "titre, album, année et genre.")
+        return
+
     fpcalc = find_fpcalc()
     t_start = time.monotonic()
-    log(f"\nIdentification de {len(files)} copie(s) compressée(s)…")
+    log(f"\nIdentification de {len(pending)} copie(s) compressée(s)…")
 
     ok = no_match = failed = 0
-    for i, path in enumerate(files, 1):
+    for i, path in enumerate(pending, 1):
         name = os.path.relpath(path, out_root)
         probe = ffprobe_json(path)
         dur = duration_seconds(probe)
-        log(f"  [{i}/{len(files)}] {name}")
+        log(f"  [{i}/{len(pending)}] {name}")
         t0 = time.monotonic()
         try:
             fp = fingerprint(path, dur, fpcalc)
@@ -882,7 +1134,11 @@ def cmd_identify(args, compress_result=None):
             + (f" — {genre}" if genre else "")
             + f"  (score {score:.2f}, Δ{delta}s, {time.monotonic() - t0:.1f} s)")
         ok += 1
-    log(f"\nIdentification : {ok} tagués, {no_match} sans correspondance, {failed} échecs"
+    summary = (f"\nIdentification : {ok} tagués, {no_match} sans correspondance, "
+               f"{failed} échecs")
+    if already_tagged:
+        summary += f", {already_tagged} déjà tagués ignorés"
+    log(summary
         + (f" — {time.monotonic() - t_start:.1f} s" if ok + no_match + failed else ""))
 
 
