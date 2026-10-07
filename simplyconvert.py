@@ -43,7 +43,7 @@ import urllib.request
 import numpy as np
 from mutagen import File as MutagenFile, MutagenError
 from mutagen.flac import FLAC, Picture
-from mutagen.id3 import APIC, ID3
+from mutagen.id3 import APIC, ID3, TALB, TCON, TDRC, TIT2, TPE1
 from mutagen.mp4 import MP4Cover
 from mutagen.oggopus import OggOpus
 
@@ -452,6 +452,67 @@ _ID3_WRITABLE = {
     "isrc", "copyright", "lyrics", "label", "catalognumber", "barcode",
     "encoder",
 }
+
+
+# Canonical key → ID3 frame, the reverse of the §3.2 table: identify writes
+# title/artist/album/date/genre whatever the container. mutagen only ships its
+# easy ("title") interface for SOME containers: an MP3 or an Ogg/Opus copy
+# takes `audio["title"] = …`, but a WAVE/AIFF/AAC copy comes back frame-based,
+# where the very same line raises TypeError("… not a Frame instance"). Both
+# the write path and the readers below go through this table instead of
+# trusting the wrapper class.
+_ID3_FRAME_FOR = {
+    "title": "TIT2",
+    "artist": "TPE1",
+    "album": "TALB",
+    "date": "TDRC",
+    "genre": "TCON",
+}
+_ID3_WRITE_FRAMES = {
+    "title": TIT2,
+    "artist": TPE1,
+    "album": TALB,
+    "date": TDRC,
+    "genre": TCON,
+}
+
+
+def read_field(tags, key: str):
+    """Read one canonical field (`title`, `artist`, …) from any container.
+
+    The easy interface is not universal: a `.mp3` whose content is actually
+    RIFF (common in "Pour lecteur MP3" folders) reports its title as `TIT2`,
+    never as `title`, so the §3.2 frame spelling is tried as well.
+    """
+    if tags is None or not hasattr(tags, "get"):
+        return None
+    value = tags.get(key)
+    if value is None and key in _ID3_FRAME_FOR:
+        value = tags.get(_ID3_FRAME_FOR[key])
+    return value
+
+
+def write_fields(audio, fields: dict) -> None:
+    """Write {canonical key: value} on *audio*, whatever its container.
+
+    Frame-based ID3 containers reject `audio["title"] = …` with a TypeError
+    ("… not a Frame instance") — the §3.2 frames are written instead, each one
+    replacing the frames already there so a second run never duplicates a
+    field. Every other container keeps the easy keys, exactly as before.
+    """
+    if audio.tags is None:
+        audio.add_tags()
+    if isinstance(audio.tags, ID3):
+        for key, value in fields.items():
+            if not value:
+                continue
+            frame = _ID3_WRITE_FRAMES[key](encoding=3, text=[str(value)])
+            audio.tags.delall(frame.FrameID)
+            audio.tags.add(frame)
+        return
+    for key, value in fields.items():
+        if value:
+            audio[key] = value
 
 
 def _id3_key(key: str) -> str:
@@ -1001,7 +1062,7 @@ def needs_identification(path: str) -> bool:
 
     def present(*keys):
         for k in keys:
-            v = tags.get(k)
+            v = read_field(tags, k)
             if v is None:
                 continue
             items = v if isinstance(v, (list, tuple)) else [v]
@@ -1092,8 +1153,9 @@ def cmd_identify(args, compress_result=None):
             current_tags = current_audio.tags or {} if current_audio is not None else {}
         except (MutagenError, OSError):
             current_tags = {}
-        needs_year = not bool(current_tags.get("date") or current_tags.get("year"))
-        needs_genre = not bool(current_tags.get("genre"))
+        needs_year = not bool(read_field(current_tags, "date")
+                              or read_field(current_tags, "year"))
+        needs_genre = not bool(read_field(current_tags, "genre"))
         album, year, genre, cover = fetch_album_info(
             rec, needs_year=needs_year, needs_genre=needs_genre,
         )
@@ -1107,18 +1169,16 @@ def cmd_identify(args, compress_result=None):
             audio = MutagenFile(path, easy=True)
             if audio is None:
                 raise MutagenError("format non géré")
-            if audio.tags is None:
-                audio.add_tags()
-            audio["title"] = title
-            audio["artist"] = artist
-            if album:
-                audio["album"] = album
-            if year:
-                audio["date"] = year
-            if genre:
-                audio["genre"] = genre
+            write_fields(audio, {"title": title, "artist": artist,
+                                 "album": album, "date": year, "genre": genre})
             audio.save()
-        except MutagenError as e:
+        except (MutagenError, OSError, TypeError, AttributeError) as e:
+            # TypeError and AttributeError are NOT MutagenError, but they are
+            # how mutagen reports a container/tag combination it cannot
+            # express: the raw TypeError("'Torn' not a Frame instance") on a
+            # frame-based container, an AttributeError on one without
+            # add_tags. Such a raw exception used to abort the whole run 257
+            # files in; now the copy is just counted as one failure.
             log(f"      balises impossibles : {e}")
             failed += 1
             continue
